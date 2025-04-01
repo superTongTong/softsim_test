@@ -9,6 +9,7 @@
 
 #include <modem/lte_lc.h>
 #include <modem/nrf_modem_lib.h>
+#include <modem/modem_info.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/net/socket.h>
@@ -19,6 +20,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/pm/pm.h>
 
 LOG_MODULE_REGISTER(softsim_sample, LOG_LEVEL_INF);
 
@@ -32,20 +34,48 @@ static int client_fd;
 static struct sockaddr_storage host_addr;
 static struct k_work_delayable server_transmission_work;
 
+// Signal quality tracking
+static int16_t current_rsrp = 0;
+static int16_t current_rsrq = 0;
+
+static void request_signal_quality(void)
+{
+    int err;
+    
+    // Request neighbor cell measurements (includes signal strength)
+    struct lte_lc_ncellmeas_params params = {0};
+    err = lte_lc_neighbor_cell_measurement(&params);
+    if (err) {
+        LOG_WRN("Failed to request neighbor cell measurements: %d", err);
+
+    } else {
+        LOG_DBG("Neighbor cell measurement requested");
+    }
+}
 
 static void server_transmission_work_fn(struct k_work *work)
 {
-  char buffer[] = "{\"message\":\"Hello from Onomondo!\"}";
+    // Get fresh signal quality before sending
+    request_signal_quality();
+    
+    // Give a little time for signal quality to update
+    k_sleep(K_MSEC(100));
+    
+    // Create JSON with signal quality
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), 
+             "{\"message\":\"Hello from Onomondo!\",\"rsrp\":%d,\"rsrq\":%d}", 
+             current_rsrp, current_rsrq);
 
-  int err = send(client_fd, buffer, sizeof(buffer) - 1, 0);
+    int err = send(client_fd, buffer, strlen(buffer), 0);
 
-  if (err < 0) {
-    LOG_ERR("Failed to transmit UDP packet, %d", errno);
-    k_work_schedule(&server_transmission_work, K_SECONDS(2));
-    return;
-  }
+    if (err < 0) {
+        LOG_ERR("Failed to transmit UDP packet, %d", errno);
+        k_work_schedule(&server_transmission_work, K_SECONDS(2));
+        return;
+    }
 
-  k_work_schedule(&server_transmission_work, K_SECONDS(150));
+    k_work_schedule(&server_transmission_work, K_SECONDS(15));
 }
 
 static void work_init(void)
@@ -55,40 +85,73 @@ static void work_init(void)
 
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
-  switch (evt->type) {
-    case LTE_LC_EVT_NW_REG_STATUS:
-      if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
-          (evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
-        break;
-      }
+    switch (evt->type) {
+        case LTE_LC_EVT_NW_REG_STATUS:
+            if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
+                (evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
+                break;
+            }
 
-      LOG_INF("Network registration status: %s",
-              evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ? "Connected - home network" : "Connected - roaming");
-      k_sem_give(&lte_connected);
-      break;
-    case LTE_LC_EVT_PSM_UPDATE:
-      LOG_INF("PSM parameter update: TAU: %d, Active time: %d", evt->psm_cfg.tau, evt->psm_cfg.active_time);
-      break;
-    case LTE_LC_EVT_EDRX_UPDATE: {
-      char log_buf[60];
-      ssize_t len;
+            LOG_INF("Network registration status: %s",
+                  evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ? 
+                  "Connected - home network" : "Connected - roaming");
+                  
+            k_sem_give(&lte_connected);
+            break;
+        
+        case LTE_LC_EVT_PSM_UPDATE:
+            LOG_INF("PSM parameter update: TAU: %d, Active time: %d", evt->psm_cfg.tau, evt->psm_cfg.active_time);
+            break;
+        case LTE_LC_EVT_EDRX_UPDATE: {
+            char log_buf[60];
+            ssize_t len;
 
-      len = snprintf(log_buf, sizeof(log_buf), "eDRX parameter update: eDRX: %f, PTW: %f",
-                     (double)evt->edrx_cfg.edrx, (double)evt->edrx_cfg.ptw);
-      if (len > 0) {
-        LOG_INF("%s\n", log_buf);
-      }
-      break;
+            len = snprintf(log_buf, sizeof(log_buf), "eDRX parameter update: eDRX: %f, PTW: %f",
+                           (double)evt->edrx_cfg.edrx, (double)evt->edrx_cfg.ptw);
+            if (len > 0) {
+                LOG_INF("%s\n", log_buf);
+            }
+            break;
+        }
+        case LTE_LC_EVT_RRC_UPDATE:
+            LOG_INF("RRC mode: %s\n", evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ? "Connected" : "Idle");
+            break;
+        case LTE_LC_EVT_CELL_UPDATE:
+            LOG_INF("LTE cell changed: Cell ID: %d, Tracking area: %d", evt->cell.id, evt->cell.tac);
+            break;
+
+        // Add signal strength event handler
+        case LTE_LC_EVT_NEIGHBOR_CELL_MEAS:
+        LOG_INF("Neighbor cell measurement event received");
+            
+        if (evt->cells_info.current_cell.id != LTE_LC_CELL_EUTRAN_ID_INVALID) {
+            // Current cell information is available
+            current_rsrp = RSRP_IDX_TO_DBM(evt->cells_info.current_cell.rsrp);
+            current_rsrq = RSRQ_IDX_TO_DB(evt->cells_info.current_cell.rsrq);
+            
+            LOG_INF("Current cell: ID=%d, RSRP=%d dBm, RSRQ=%d dB", 
+                   evt->cells_info.current_cell.id,
+                   current_rsrp,
+                   current_rsrq);
+        }
+        
+        if (evt->cells_info.ncells_count > 0) {
+            // Neighboring cells information is available
+            LOG_INF("Found %d neighbor cells", evt->cells_info.ncells_count);
+            
+            for (int i = 0; i < evt->cells_info.ncells_count; i++) {
+                LOG_INF("Neighbor cell %d: PCI=%d, RSRP=%d dBm, RSRQ=%d dB",
+                       i+1,
+                       evt->cells_info.neighbor_cells[i].phys_cell_id,
+                       RSRP_IDX_TO_DBM(evt->cells_info.neighbor_cells[i].rsrp),
+                       RSRQ_IDX_TO_DB(evt->cells_info.neighbor_cells[i].rsrq));
+            }
+        }
+            break;
+            
+        default:
+            break;
     }
-    case LTE_LC_EVT_RRC_UPDATE:
-      LOG_INF("RRC mode: %s\n", evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ? "Connected" : "Idle");
-      break;
-    case LTE_LC_EVT_CELL_UPDATE:
-      LOG_INF("LTE cell changed: Cell ID: %d, Tracking area: %d", evt->cell.id, evt->cell.tac);
-      break;
-    default:
-      break;
-  }
 }
 
 static void modem_connect(void)
@@ -159,6 +222,9 @@ int main(void)
   } while (k_sem_take(&lte_connected, K_SECONDS(10)));
 
   LOG_INF("LTE connected!\n");
+  // Request initial signal quality check
+  request_signal_quality();
+
   err = server_init();
   if (err) {
     LOG_ERR("Not able to initialize UDP server connection\n");
