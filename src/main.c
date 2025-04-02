@@ -55,7 +55,7 @@ static void request_signal_quality(void)
 
 static void server_transmission_work_fn(struct k_work *work)
 {
-    // Get fresh signal quality before sending
+  // Get fresh signal quality before sending
     request_signal_quality();
     
     // Give a little time for signal quality to update
@@ -75,7 +75,7 @@ static void server_transmission_work_fn(struct k_work *work)
         return;
     }
 
-    k_work_schedule(&server_transmission_work, K_SECONDS(15));
+    k_work_schedule(&server_transmission_work, K_SECONDS(180)); // Schedule next transmission in 3 minutes
 }
 
 static void work_init(void)
@@ -101,6 +101,9 @@ static void lte_handler(const struct lte_lc_evt *const evt)
         
         case LTE_LC_EVT_PSM_UPDATE:
             LOG_INF("PSM parameter update: TAU: %d, Active time: %d", evt->psm_cfg.tau, evt->psm_cfg.active_time);
+            if (evt->psm_cfg.active_time == -1){
+              LOG_ERR("Network rejected PSM parameters. Failed to enable PSM");
+            }
             break;
         case LTE_LC_EVT_EDRX_UPDATE: {
             char log_buf[60];
@@ -140,7 +143,7 @@ static void lte_handler(const struct lte_lc_evt *const evt)
             LOG_INF("Found %d neighbor cells", evt->cells_info.ncells_count);
             
             for (int i = 0; i < evt->cells_info.ncells_count; i++) {
-                LOG_INF("Neighbor cell %d: PCI=%d, RSRP=%d dBm, RSRQ=%d dB",
+                LOG_INF("Neighbor cell %d: PCI=%d, RSRP=%.2f dBm, RSRQ=%.2f dB",
                        i+1,
                        evt->cells_info.neighbor_cells[i].phys_cell_id,
                        RSRP_IDX_TO_DBM(evt->cells_info.neighbor_cells[i].rsrp),
@@ -157,10 +160,10 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 static void modem_connect(void)
 {
   int err = lte_lc_connect_async(lte_handler);
-  if (err) {
-    LOG_ERR("Connecting to LTE network failed, error: %d", err);
-    return;
-  }
+    if (err) {
+        LOG_ERR("Connecting to LTE network failed, error: %d", err);
+        return;
+    }
 }
 
 static void server_disconnect(void)
