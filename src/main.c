@@ -21,6 +21,8 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/pm/pm.h>
+// header for GNSS interface
+#include <nrf_modem_gnss.h>
 
 LOG_MODULE_REGISTER(softsim_sample, LOG_LEVEL_INF);
 
@@ -34,9 +36,28 @@ static int client_fd;
 static struct sockaddr_storage host_addr;
 static struct k_work_delayable server_transmission_work;
 
+// define the GNSS data structure
+static struct nrf_modem_gnss_pvt_data_frame pvt_data;
+// Declare helper variables to find the TTFF
+static int64_t gnss_start_time;
+static bool first_fix = false;
+
 // Signal quality tracking
 static int16_t current_rsrp = 0;
 static int16_t current_rsrq = 0;
+
+// Function to print GNSS data
+static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
+{
+	LOG_INF("Latitude:       %.06f", pvt_data->latitude);
+	LOG_INF("Longitude:      %.06f", pvt_data->longitude);
+	LOG_INF("Altitude:       %.01f m", (double)pvt_data->altitude);
+	LOG_INF("Time (UTC):     %02u:%02u:%02u.%03u",
+	       pvt_data->datetime.hour,
+	       pvt_data->datetime.minute,
+	       pvt_data->datetime.seconds,
+	       pvt_data->datetime.ms);
+}
 
 static void request_signal_quality(void)
 {
@@ -64,7 +85,7 @@ static void server_transmission_work_fn(struct k_work *work)
     // Create JSON with signal quality
     char buffer[128];
     snprintf(buffer, sizeof(buffer), 
-             "{\"message\":\"Hello from Onomondo!\",\"rsrp\":%d,\"rsrq\":%d}", 
+             "{\"message\":\"rsrp\":%d,\"rsrq\":%d}", 
              current_rsrp, current_rsrq);
 
     int err = send(client_fd, buffer, strlen(buffer), 0);
