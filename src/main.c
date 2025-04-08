@@ -13,10 +13,10 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/net/socket.h>
-#include <zephyr/drivers/clock_control.h>
-#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+// #include <zephyr/drivers/clock_control.h>
+// #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
+// #include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/reboot.h>
@@ -28,6 +28,7 @@ LOG_MODULE_REGISTER(softsim_sample, LOG_LEVEL_INF);
 
 // semaphores
 K_SEM_DEFINE(lte_connected, 0, 1);	// semaphore to signal that the LTE connection is established
+K_SEM_DEFINE(gnss_fix, 0, 1); // Semaphore for GNSS fix
 
 static void lte_handler(const struct lte_lc_evt *const evt);
 static int server_connect(void);
@@ -36,28 +37,16 @@ static int client_fd;
 static struct sockaddr_storage host_addr;
 static struct k_work_delayable server_transmission_work;
 
-// define the GNSS data structure
-static struct nrf_modem_gnss_pvt_data_frame pvt_data;
-// Declare helper variables to find the TTFF
-static int64_t gnss_start_time;
-static bool first_fix = false;
+// Add with your other global variables
+static bool gnss_running = false;
+static double latitude = 0.0;
+static double longitude = 0.0;
+static float accuracy = 0.0;
+static bool has_fix = false;
 
 // Signal quality tracking
 static int16_t current_rsrp = 0;
 static int16_t current_rsrq = 0;
-
-// Function to print GNSS data
-static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
-{
-	LOG_INF("Latitude:       %.06f", pvt_data->latitude);
-	LOG_INF("Longitude:      %.06f", pvt_data->longitude);
-	LOG_INF("Altitude:       %.01f m", (double)pvt_data->altitude);
-	LOG_INF("Time (UTC):     %02u:%02u:%02u.%03u",
-	       pvt_data->datetime.hour,
-	       pvt_data->datetime.minute,
-	       pvt_data->datetime.seconds,
-	       pvt_data->datetime.ms);
-}
 
 static void request_signal_quality(void)
 {
@@ -74,6 +63,52 @@ static void request_signal_quality(void)
     }
 }
 
+static int request_gnss_fix(bool wait_for_fix)
+{
+    int err;
+    
+    // If GNSS is already running, do nothing
+    if (gnss_running) {
+        LOG_INF("GNSS is already running");
+        return 0;
+    }
+    
+    LOG_INF("Starting GNSS fix");
+    
+    // Clear the semaphore before starting
+    k_sem_reset(&gnss_fix);
+    
+    // Start GNSS
+    err = nrf_modem_gnss_start();
+    if (err) {
+        LOG_ERR("Failed to start GNSS: %d", err);
+        return err;
+    }
+    
+    gnss_running = true;
+    
+    if (wait_for_fix) {
+        LOG_INF("Waiting for GNSS fix (timeout: 60s)");
+        
+        // Wait for a fix or timeout
+        if (k_sem_take(&gnss_fix, K_SECONDS(60)) != 0) {
+            LOG_WRN("GNSS fix timed out");
+            
+            // Stop GNSS to save power
+            err = nrf_modem_gnss_stop();
+            if (err) {
+                LOG_ERR("Failed to stop GNSS: %d", err);
+            } else {
+                gnss_running = false;
+            }
+            
+            return -ETIMEDOUT;
+        }
+    }
+    
+    return 0;
+}
+
 static void server_transmission_work_fn(struct k_work *work)
 {
   // Get fresh signal quality before sending
@@ -81,12 +116,19 @@ static void server_transmission_work_fn(struct k_work *work)
     
     // Give a little time for signal quality to update
     k_sleep(K_MSEC(100));
+
+    // Request GNSS location before sending
+    LOG_INF("Requesting GNSS location fix");
+    int gnss_err = request_gnss_fix(true); // true = wait for fix
+    if (gnss_err) {
+        LOG_WRN("Could not get GPS fix, sending last known position or zeros");
+    }
     
     // Create JSON with signal quality
-    char buffer[128];
+    char buffer[256];
     snprintf(buffer, sizeof(buffer), 
-             "{\"message\":\"rsrp\":%d,\"rsrq\":%d}", 
-             current_rsrp, current_rsrq);
+             "{\"message\":\"rsrp\":%d,\"rsrq\":%d,\"lat\":%.6f,\"lon\":%.6f,\"accuracy\":%.1f,\"has_fix\":%s}", 
+             current_rsrp, current_rsrq, latitude, longitude, accuracy, has_fix ? "true" : "false");
 
     int err = send(client_fd, buffer, strlen(buffer), 0);
 
@@ -102,6 +144,94 @@ static void server_transmission_work_fn(struct k_work *work)
 static void work_init(void)
 {
   k_work_init_delayable(&server_transmission_work, server_transmission_work_fn);
+}
+
+static void gnss_event_handler(int event)
+{
+	int err, num_satellites;
+  struct nrf_modem_gnss_pvt_data_frame pvt_data;
+
+	switch (event) {
+	case NRF_MODEM_GNSS_EVT_PVT:
+		num_satellites = 0;
+		for (int i = 0; i < 12 ; i++) {
+			if (pvt_data.sv[i].signal != 0) {
+				num_satellites++;
+			}
+		}
+		LOG_INF("Searching. Current satellites: %d", num_satellites);
+		err = nrf_modem_gnss_read(&pvt_data, sizeof(pvt_data), NRF_MODEM_GNSS_DATA_PVT);
+		if (err) {
+			LOG_ERR("nrf_modem_gnss_read failed, err %d", err);
+			return;
+		}
+		if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) {
+
+      // We have a valid fix
+      latitude = pvt_data.latitude;
+      longitude = pvt_data.longitude;
+      accuracy = pvt_data.accuracy;
+      has_fix = true;
+			LOG_INF("GNSS Fix: Lat: %.6f, Lon: %.6f, Accuracy: %.1fm", 
+                      latitude, longitude, accuracy);
+                
+      // Signal that we have a fix
+      k_sem_give(&gnss_fix);
+			// After getting a fix, we can stop GNSS to save power
+      err = nrf_modem_gnss_stop();
+      if (err) {
+          LOG_ERR("Failed to stop GNSS: %d", err);
+      } else {
+          gnss_running = false;
+          LOG_INF("GNSS stopped after fix");
+      }
+		}
+		/* Check for the flags indicating GNSS is blocked */
+		if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_DEADLINE_MISSED) {
+			LOG_INF("GNSS blocked by LTE activity");
+		} else if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_NOT_ENOUGH_WINDOW_TIME) {
+			LOG_INF("Insufficient GNSS time window");
+		}
+		break;
+
+	case NRF_MODEM_GNSS_EVT_PERIODIC_WAKEUP:
+		LOG_INF("GNSS has woken up");
+		break;
+	case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
+		LOG_INF("GNSS enter sleep after fix");
+		break;
+	default:
+		break;
+	}
+}
+
+static int gnss_init(void)
+{
+    int err;
+    
+    // Register GNSS event handler
+    err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
+    if (err) {
+        LOG_ERR("Failed to set GNSS event handler: %d", err);
+        return err;
+    }
+
+    // Set fix interval to single fix (0 = single, >0 = periodic interval in seconds)
+    uint16_t fix_interval = 0; // Single fix
+    err = nrf_modem_gnss_fix_interval_set(fix_interval);
+    if (err) {
+        LOG_ERR("Failed to set fix interval: %d", err);
+    }
+    
+    // Set fix timeout to 60 seconds
+    uint16_t fix_timeout = 60;
+    err = nrf_modem_gnss_fix_retry_set(fix_timeout);
+    if (err) {
+        LOG_ERR("Failed to set fix timeout: %d", err);
+    }
+    
+    LOG_INF("GNSS initialized successfully");
+    return 0;
 }
 
 static void lte_handler(const struct lte_lc_evt *const evt)
@@ -246,6 +376,13 @@ int main(void)
   } while (k_sem_take(&lte_connected, K_SECONDS(10)));
 
   LOG_INF("LTE connected!\n");
+
+  // Initialize GNSS
+  err = gnss_init();
+  if (err) {
+      LOG_ERR("Failed to initialize GNSS: %d", err);
+      // Continue anyway - we'll send without GPS data
+  }
   // Request initial signal quality check
   request_signal_quality();
 
